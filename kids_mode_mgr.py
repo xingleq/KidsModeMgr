@@ -142,13 +142,14 @@ def apply_registry_acl():
         users_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinUsersSid, None)
 
         # SYSTEM & Administrators: 完全控制
+        # KEY_ALL_ACCESS / KEY_READ 属于 win32con，不在 ntsecuritycon 中
         dacl.AddAccessAllowedAce(win32security.ACL_REVISION,
-                                  con.KEY_ALL_ACCESS, system_sid)
+                                  win32con.KEY_ALL_ACCESS, system_sid)
         dacl.AddAccessAllowedAce(win32security.ACL_REVISION,
-                                  con.KEY_ALL_ACCESS, admins_sid)
+                                  win32con.KEY_ALL_ACCESS, admins_sid)
         # 普通用户：只读
         dacl.AddAccessAllowedAce(win32security.ACL_REVISION,
-                                  con.KEY_READ, users_sid)
+                                  win32con.KEY_READ, users_sid)
 
         win32security.SetNamedSecurityInfo(
             f"MACHINE\\{REG_PATH}",
@@ -228,6 +229,10 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         # uptime_at_lock 存在内存；LastForceLockTime 存 wall clock 作为持久化备份
         self.uptime_at_lock = None
 
+        # 服务启动时尝试从 wall clock 重建 uptime_at_lock，
+        # 使本次服务启动后仍能用 uptime 防篡改（而非纯 wall clock 降级）
+        self._try_restore_uptime_at_lock()
+
         # 预警状态，避免重复弹窗
         self.warned_3min = False
         self.warned_30sec = False
@@ -269,7 +274,17 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         }
 
     def load_lock_state(self):
-        """读取上次锁屏的 wall-clock 时间戳（持久化）。"""
+        """读取上次锁屏的 wall-clock 时间戳（持久化）。
+        优先读 REG_DWORD 整数键（不受字符串解析失败影响），降级读字符串键。
+        """
+        # 优先用整数键（更可靠）
+        val_int = self._get_reg_value("LastForceLockTimeInt", None)
+        if val_int is not None:
+            try:
+                return float(val_int)
+            except Exception:
+                pass
+        # 降级：字符串键
         val = self._get_reg_value("LastForceLockTime", "0")
         try:
             return float(val)
@@ -277,7 +292,33 @@ class KidsModeService(win32serviceutil.ServiceFramework):
             return 0.0
 
     def save_lock_state(self, ts):
-        self._set_reg_value("LastForceLockTime", str(ts), winreg.REG_SZ)
+        # 同时写 REG_SZ（wall clock）和 REG_DWORD（整数秒，防止字符串解析失败）
+        self._set_reg_value("LastForceLockTime",    str(ts), winreg.REG_SZ)
+        self._set_reg_value("LastForceLockTimeInt", int(ts), winreg.REG_DWORD)
+
+    def _try_restore_uptime_at_lock(self):
+        """
+        服务重启后，uptime_at_lock 丢失。若注册表记录的锁屏 wall-clock 时间显示
+        仍在休息期内，则用当前 uptime 反推一个等效的 uptime_at_lock，
+        后续判断继续用 uptime 差值而非 wall clock，抵抗时间篡改。
+        """
+        try:
+            mandatory_rest = self._get_reg_value("MandatoryRest", 300)
+            last_lock_wall = self.load_lock_state()
+            if last_lock_wall <= 0:
+                return
+            elapsed_wall = time.time() - last_lock_wall
+            if elapsed_wall < mandatory_rest:
+                # 仍在休息期：反推 uptime_at_lock
+                # uptime_at_lock = 当前 uptime - 已经过的秒数（按 wall clock 估算）
+                # 若 wall clock 被篡改导致 elapsed_wall < 0，保守取 0（视为刚锁屏）
+                elapsed_wall = max(0.0, elapsed_wall)
+                self.uptime_at_lock = get_uptime_seconds() - elapsed_wall
+                servicemanager.LogInfoMsg(
+                    f"服务重启：恢复 uptime_at_lock，休息期剩余约 {int(mandatory_rest - elapsed_wall)} 秒"
+                )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 计时持久化（Task #4）
@@ -346,13 +387,18 @@ class KidsModeService(win32serviceutil.ServiceFramework):
 
         if active_session is not None:
             # --- 强制休息期检查（最高优先级）---
-            if enable_rest and (self.uptime_at_lock is not None or last_lock_wall > 0):
+            # 注意：只要曾经触发过锁屏（last_lock_wall > 0），就必须检查休息期，
+            # 无论 uptime_at_lock 是否存在（服务重启会导致其丢失）。
+            if enable_rest and last_lock_wall > 0:
                 if self.uptime_at_lock is not None:
-                    # 用 uptime 差值，防时间篡改
+                    # 首选：用系统 uptime 差值，完全免疫 wall clock 篡改
                     elapsed_rest = current_uptime - self.uptime_at_lock
                 else:
                     # 服务重启后 uptime_at_lock 丢失，降级用 wall clock
+                    # 为防止修改系统时间绕过，elapsed 不允许超过 mandatory_rest
                     elapsed_rest = time.time() - last_lock_wall
+                    # 若 elapsed 为负（时间被调回），视为 0，继续强制休息
+                    elapsed_rest = max(0.0, elapsed_rest)
 
                 if elapsed_rest < mandatory_rest:
                     remaining = int(mandatory_rest - elapsed_rest)
