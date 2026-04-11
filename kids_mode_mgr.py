@@ -24,6 +24,16 @@ import threading
 # =============================================================================
 WTS_CURRENT_SERVER_HANDLE = 0
 WTSActive = 0
+WTSConnected = 1
+WTSConnectQuery = 2
+WTSShadow = 3
+WTSDisconnected = 4
+WTSIdle = 5
+WTSListen = 6
+WTSReset = 7
+WTSDown = 8
+WTSInit = 9
+INVALID_SESSION_ID = 0xFFFFFFFF
 MB_OK = 0
 MB_ICONWARNING = 0x30
 MB_ICONINFORMATION = 0x40
@@ -35,26 +45,109 @@ class WTS_SESSION_INFO(ctypes.Structure):
 
 wtsapi32 = ctypes.windll.wtsapi32
 kernel32 = ctypes.windll.kernel32
+kernel32.WTSGetActiveConsoleSessionId.restype = ctypes.c_uint32
 
-def get_active_session_id():
+WTS_STATE_NAMES = {
+    WTSActive: "Active",
+    WTSConnected: "Connected",
+    WTSConnectQuery: "ConnectQuery",
+    WTSShadow: "Shadow",
+    WTSDisconnected: "Disconnected",
+    WTSIdle: "Idle",
+    WTSListen: "Listen",
+    WTSReset: "Reset",
+    WTSDown: "Down",
+    WTSInit: "Init",
+}
+
+def wts_state_name(state):
+    return WTS_STATE_NAMES.get(int(state), f"Unknown({state})")
+
+def _decode_station_name(raw_name):
+    if not raw_name:
+        return ""
+    if isinstance(raw_name, bytes):
+        return raw_name.decode("utf-8", errors="ignore")
+    return str(raw_name)
+
+def enumerate_sessions():
     pSessionInfo = ctypes.POINTER(WTS_SESSION_INFO)()
     pCount = ctypes.c_uint32()
+    sessions = []
     if wtsapi32.WTSEnumerateSessionsA(WTS_CURRENT_SERVER_HANDLE, 0, 1,
                                        ctypes.byref(pSessionInfo), ctypes.byref(pCount)):
-        active_session = None
-        for i in range(pCount.value):
-            sess = pSessionInfo[i]
-            if sess.State == WTSActive:
-                active_session = sess.SessionId
-                break
-        wtsapi32.WTSFreeMemory(pSessionInfo)
-        return active_session
-    return None
+        try:
+            for i in range(pCount.value):
+                sess = pSessionInfo[i]
+                sessions.append({
+                    "session_id": int(sess.SessionId),
+                    "state": int(sess.State),
+                    "state_name": wts_state_name(sess.State),
+                    "station_name": _decode_station_name(sess.pWinStationName),
+                })
+        finally:
+            wtsapi32.WTSFreeMemory(pSessionInfo)
+    return sessions
+
+def get_console_session_info():
+    console_session_id = int(kernel32.WTSGetActiveConsoleSessionId())
+    if console_session_id == INVALID_SESSION_ID:
+        console_session_id = None
+
+    sessions = enumerate_sessions()
+    console_session = None
+    for session in sessions:
+        if session["session_id"] == console_session_id:
+            console_session = session
+            break
+
+    if console_session is None:
+        return {
+            "console_session_id": console_session_id,
+            "active_session_id": None,
+            "is_active": False,
+            "state": None,
+            "state_name": "NotFound",
+            "station_name": "",
+            "sessions": sessions,
+        }
+
+    is_active = console_session["state"] == WTSActive
+    return {
+        "console_session_id": console_session_id,
+        "active_session_id": console_session_id if is_active else None,
+        "is_active": is_active,
+        "state": console_session["state"],
+        "state_name": console_session["state_name"],
+        "station_name": console_session["station_name"],
+        "sessions": sessions,
+    }
+
+def format_session_snapshot(console_info):
+    sessions = console_info.get("sessions", [])
+    if sessions:
+        session_text = "; ".join(
+            f"id={sess['session_id']},station={sess['station_name'] or '-'},state={sess['state_name']}"
+            for sess in sessions
+        )
+    else:
+        session_text = "none"
+
+    console_session_id = console_info.get("console_session_id")
+    console_session_text = "None" if console_session_id is None else str(console_session_id)
+    station_name = console_info.get("station_name") or "-"
+    return (
+        f"console_id={console_session_text}, "
+        f"console_station={station_name}, "
+        f"console_state={console_info.get('state_name', 'Unknown')}, "
+        f"console_active={'yes' if console_info.get('is_active') else 'no'}, "
+        f"sessions=[{session_text}]"
+    )
 
 def disconnect_session(session_id):
     if session_id is None:
-        return
-    wtsapi32.WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, False)
+        return False
+    return bool(wtsapi32.WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, False))
 
 def _send_message_blocking(session_id, title, message, style, timeout):
     """在独立线程中阻塞调用 WTSSendMessageW，timeout 秒后弹窗自动关闭。"""
@@ -224,6 +317,9 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         self.is_running = True
         self.current_usage_seconds = 0
         self.session_was_active = False
+        self.last_console_snapshot = None
+        self.last_rest_log_bucket = None
+        self.rest_end_logged = False
 
         # 防时间篡改：记录锁屏时的系统 uptime，而非 wall clock
         # uptime_at_lock 存在内存；LastForceLockTime 存 wall clock 作为持久化备份
@@ -346,6 +442,24 @@ class KidsModeService(win32serviceutil.ServiceFramework):
             self.last_persist_minute = current_minute
             self._set_reg_value(self._today_key(), usage)
 
+    def _log_console_snapshot(self, console_info):
+        snapshot = format_session_snapshot(console_info)
+        if snapshot != self.last_console_snapshot:
+            write_log(f"控制台会话状态变化：{snapshot}")
+            self.last_console_snapshot = snapshot
+
+    def _log_rest_block(self, console_info, remaining, source):
+        current_bucket = remaining // 30
+        if self.last_rest_log_bucket != current_bucket:
+            write_log(
+                f"休息期拦截控制台登录：剩余 {remaining} 秒，判定来源={source}，"
+                f"{format_session_snapshot(console_info)}"
+            )
+            self.last_rest_log_bucket = current_bucket
+
+    def _reset_rest_block_log(self):
+        self.last_rest_log_bucket = None
+
     # ------------------------------------------------------------------
     # 服务主循环
     # ------------------------------------------------------------------
@@ -375,43 +489,49 @@ class KidsModeService(win32serviceutil.ServiceFramework):
     # ------------------------------------------------------------------
     def check_logic(self):
         config = self.load_config()
-        max_usage        = config["max_usage_seconds"]
-        mandatory_rest   = config["mandatory_rest_seconds"]
-        enable_rest      = config["enable_mandatory_rest"]
+        max_usage = config["max_usage_seconds"]
+        mandatory_rest = config["mandatory_rest_seconds"]
+        enable_rest = config["enable_mandatory_rest"]
 
-        # 防时间篡改：优先使用 uptime 差值判断休息期（Task #5）
         current_uptime = get_uptime_seconds()
         last_lock_wall = self.load_lock_state()
+        console_info = get_console_session_info()
+        active_session = console_info["active_session_id"]
+        self._log_console_snapshot(console_info)
 
-        active_session = get_active_session_id()
+        elapsed_rest = None
+        rest_source = None
+        if enable_rest and last_lock_wall > 0:
+            if self.uptime_at_lock is not None:
+                elapsed_rest = current_uptime - self.uptime_at_lock
+                rest_source = "uptime"
+            else:
+                elapsed_rest = max(0.0, time.time() - last_lock_wall)
+                rest_source = "wall-clock"
+
+            if elapsed_rest >= mandatory_rest and not self.rest_end_logged:
+                write_log(
+                    f"休息期结束：已过去 {int(elapsed_rest)} 秒，"
+                    f"{format_session_snapshot(console_info)}"
+                )
+                self.rest_end_logged = True
+                self._reset_rest_block_log()
 
         if active_session is not None:
-            # --- 强制休息期检查（最高优先级）---
-            # 注意：只要曾经触发过锁屏（last_lock_wall > 0），就必须检查休息期，
-            # 无论 uptime_at_lock 是否存在（服务重启会导致其丢失）。
-            if enable_rest and last_lock_wall > 0:
-                if self.uptime_at_lock is not None:
-                    # 首选：用系统 uptime 差值，完全免疫 wall clock 篡改
-                    elapsed_rest = current_uptime - self.uptime_at_lock
-                else:
-                    # 服务重启后 uptime_at_lock 丢失，降级用 wall clock
-                    # 为防止修改系统时间绕过，elapsed 不允许超过 mandatory_rest
-                    elapsed_rest = time.time() - last_lock_wall
-                    # 若 elapsed 为负（时间被调回），视为 0，继续强制休息
-                    elapsed_rest = max(0.0, elapsed_rest)
+            if enable_rest and elapsed_rest is not None and elapsed_rest < mandatory_rest:
+                remaining = int(mandatory_rest - elapsed_rest)
+                servicemanager.LogInfoMsg(f"Mandatory rest active, remaining: {remaining}s")
+                self._log_rest_block(console_info, remaining, rest_source)
+                self.current_usage_seconds = 0
+                self.session_was_active = False
+                if not disconnect_session(active_session):
+                    write_log(f"休息期断开控制台会话失败：session_id={active_session}")
+                return
 
-                if elapsed_rest < mandatory_rest:
-                    remaining = int(mandatory_rest - elapsed_rest)
-                    servicemanager.LogInfoMsg(f"强制休息期，剩余: {remaining}秒")
-                    self.current_usage_seconds = 0
-                    self.session_was_active = False
-                    disconnect_session(active_session)
-                    return
-
-            # --- 预警通知 ---
             remaining_usage = max_usage - self.current_usage_seconds
             if remaining_usage <= 180 and not self.warned_3min:
                 self.warned_3min = True
+                write_log(f"发送 3 分钟提醒：剩余 {remaining_usage} 秒，session_id={active_session}")
                 send_session_message(
                     active_session,
                     "  儿童模式提醒  ",
@@ -422,6 +542,7 @@ class KidsModeService(win32serviceutil.ServiceFramework):
                 )
             if remaining_usage <= 30 and not self.warned_30sec:
                 self.warned_30sec = True
+                write_log(f"发送 30 秒提醒：剩余 {remaining_usage} 秒，session_id={active_session}")
                 send_session_message(
                     active_session,
                     "  儿童模式提醒  ",
@@ -431,24 +552,33 @@ class KidsModeService(win32serviceutil.ServiceFramework):
                     timeout=3,
                 )
 
-            # --- 正常计时 ---
+            if not self.session_was_active:
+                write_log(f"检测到本机控制台会话进入活动状态，开始计时：{format_session_snapshot(console_info)}")
             self.session_was_active = True
             self.current_usage_seconds += 1
             self._persist_daily_usage()
 
             if self.current_usage_seconds >= max_usage:
-                servicemanager.LogInfoMsg(f"达到最大使用时间 {max_usage}秒，执行锁屏。")
-                write_log(f"锁屏触发，当日已用: {fmt_seconds(self.current_usage_seconds)}。")
+                servicemanager.LogInfoMsg(f"Max usage reached: {max_usage}s")
+                write_log(
+                    f"锁屏触发：当日已用 {fmt_seconds(self.current_usage_seconds)}，"
+                    f"target_session={active_session}，{format_session_snapshot(console_info)}"
+                )
                 lock_ts = time.time()
                 self.save_lock_state(lock_ts)
-                self.uptime_at_lock = current_uptime  # 用 uptime 标记锁屏时刻
-                disconnect_session(active_session)
+                self.uptime_at_lock = current_uptime
+                self.rest_end_logged = False
+                self._reset_rest_block_log()
+                if not disconnect_session(active_session):
+                    write_log(f"锁屏时断开控制台会话失败：session_id={active_session}")
                 self.current_usage_seconds = 0
                 self.session_was_active = False
                 self.warned_3min = False
                 self.warned_30sec = False
                 self._set_reg_value("CurrentUsage", 0)
         else:
+            if self.session_was_active:
+                write_log(f"控制台会话离开活动状态，暂停计时：{format_session_snapshot(console_info)}")
             self.session_was_active = False
 
 # =============================================================================
