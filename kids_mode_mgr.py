@@ -33,7 +33,11 @@ WTSListen = 6
 WTSReset = 7
 WTSDown = 8
 WTSInit = 9
+WTSSessionInfoEx = 25
 INVALID_SESSION_ID = 0xFFFFFFFF
+WTS_SESSIONSTATE_LOCK = 0
+WTS_SESSIONSTATE_UNLOCK = 1
+WTS_SESSIONSTATE_UNKNOWN = 0xFFFFFFFF
 MB_OK = 0
 MB_ICONWARNING = 0x30
 MB_ICONINFORMATION = 0x40
@@ -42,6 +46,36 @@ class WTS_SESSION_INFO(ctypes.Structure):
     _fields_ = [("SessionId", ctypes.c_uint32),
                 ("pWinStationName", ctypes.c_char_p),
                 ("State", ctypes.c_uint32)]
+
+class WTSINFOEX_LEVEL1_W(ctypes.Structure):
+    _fields_ = [
+        ("SessionId", ctypes.c_uint32),
+        ("SessionState", ctypes.c_uint32),
+        ("SessionFlags", ctypes.c_int32),
+        ("WinStationName", ctypes.c_wchar * 33),
+        ("UserName", ctypes.c_wchar * 21),
+        ("DomainName", ctypes.c_wchar * 18),
+        ("LogonTime", ctypes.c_int64),
+        ("ConnectTime", ctypes.c_int64),
+        ("DisconnectTime", ctypes.c_int64),
+        ("LastInputTime", ctypes.c_int64),
+        ("CurrentTime", ctypes.c_int64),
+        ("IncomingBytes", ctypes.c_uint32),
+        ("OutgoingBytes", ctypes.c_uint32),
+        ("IncomingFrames", ctypes.c_uint32),
+        ("OutgoingFrames", ctypes.c_uint32),
+        ("IncomingCompressedBytes", ctypes.c_uint32),
+        ("OutgoingCompressedBytes", ctypes.c_uint32),
+    ]
+
+class WTSINFOEX_LEVEL_W(ctypes.Union):
+    _fields_ = [("WTSInfoExLevel1", WTSINFOEX_LEVEL1_W)]
+
+class WTSINFOEX_W(ctypes.Structure):
+    _fields_ = [
+        ("Level", ctypes.c_uint32),
+        ("Data", WTSINFOEX_LEVEL_W),
+    ]
 
 wtsapi32 = ctypes.windll.wtsapi32
 kernel32 = ctypes.windll.kernel32
@@ -62,6 +96,55 @@ WTS_STATE_NAMES = {
 
 def wts_state_name(state):
     return WTS_STATE_NAMES.get(int(state), f"Unknown({state})")
+
+def is_windows_7():
+    try:
+        version = sys.getwindowsversion()
+        return version.major == 6 and version.minor == 1
+    except Exception:
+        return False
+
+def query_session_unlocked(session_id):
+    if session_id is None:
+        return None
+
+    pBuffer = ctypes.c_void_p()
+    bytes_returned = ctypes.c_uint32()
+    try:
+        ok = wtsapi32.WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            ctypes.c_uint32(session_id),
+            ctypes.c_int(WTSSessionInfoEx),
+            ctypes.byref(pBuffer),
+            ctypes.byref(bytes_returned),
+        )
+        if not ok or not pBuffer.value or bytes_returned.value < ctypes.sizeof(WTSINFOEX_W):
+            return None
+
+        info = ctypes.cast(pBuffer, ctypes.POINTER(WTSINFOEX_W)).contents
+        if info.Level != 1:
+            return None
+
+        flags = int(info.Data.WTSInfoExLevel1.SessionFlags)
+        if flags == WTS_SESSIONSTATE_UNKNOWN:
+            return None
+
+        if is_windows_7():
+            return flags == WTS_SESSIONSTATE_LOCK
+        return flags == WTS_SESSIONSTATE_UNLOCK
+    except Exception as e:
+        write_log(f"查询会话锁定状态失败：session_id={session_id}, error={e}")
+        return None
+    finally:
+        if pBuffer.value:
+            wtsapi32.WTSFreeMemory(pBuffer)
+
+def lock_state_name(is_unlocked):
+    if is_unlocked is True:
+        return "Unlocked"
+    if is_unlocked is False:
+        return "Locked"
+    return "Unknown"
 
 def _decode_station_name(raw_name):
     if not raw_name:
@@ -105,7 +188,9 @@ def get_console_session_info():
         return {
             "console_session_id": console_session_id,
             "active_session_id": None,
+            "disconnect_session_id": None,
             "is_active": False,
+            "is_unlocked": None,
             "state": None,
             "state_name": "NotFound",
             "station_name": "",
@@ -113,10 +198,13 @@ def get_console_session_info():
         }
 
     is_active = console_session["state"] == WTSActive
+    is_unlocked = query_session_unlocked(console_session_id) if is_active else None
     return {
         "console_session_id": console_session_id,
-        "active_session_id": console_session_id if is_active else None,
+        "active_session_id": console_session_id if is_active and is_unlocked is True else None,
+        "disconnect_session_id": console_session_id if is_active else None,
         "is_active": is_active,
+        "is_unlocked": is_unlocked,
         "state": console_session["state"],
         "state_name": console_session["state_name"],
         "station_name": console_session["station_name"],
@@ -141,6 +229,7 @@ def format_session_snapshot(console_info):
         f"console_station={station_name}, "
         f"console_state={console_info.get('state_name', 'Unknown')}, "
         f"console_active={'yes' if console_info.get('is_active') else 'no'}, "
+        f"console_lock={lock_state_name(console_info.get('is_unlocked'))}, "
         f"sessions=[{session_text}]"
     )
 
@@ -336,7 +425,7 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         # 计时持久化：记录上次写入的分钟数，每分钟写一次
         self.last_persist_minute = -1
 
-        # 服务启动时从注册表恢复当日已用时间
+        # 服务启动时从注册表恢复本轮已用时间
         self._restore_daily_usage()
 
     # ------------------------------------------------------------------
@@ -392,6 +481,11 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         self._set_reg_value("LastForceLockTime",    str(ts), winreg.REG_SZ)
         self._set_reg_value("LastForceLockTimeInt", int(ts), winreg.REG_DWORD)
 
+    def clear_lock_state(self):
+        self._set_reg_value("LastForceLockTime", "0", winreg.REG_SZ)
+        self._set_reg_value("LastForceLockTimeInt", 0, winreg.REG_DWORD)
+        self.uptime_at_lock = None
+
     def _try_restore_uptime_at_lock(self):
         """
         服务重启后，uptime_at_lock 丢失。若注册表记录的锁屏 wall-clock 时间显示
@@ -423,16 +517,16 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         return "DailyUsage_" + date.today().strftime("%Y%m%d")
 
     def _restore_daily_usage(self):
-        """服务启动时恢复当日已用秒数，跨天自动忽略。"""
+        """服务启动时恢复本轮已用秒数，跨天自动忽略。"""
         val = self._get_reg_value(self._today_key(), 0)
         try:
             self.current_usage_seconds = int(val)
-            servicemanager.LogInfoMsg(f"恢复当日已用时间: {self.current_usage_seconds}秒")
+            servicemanager.LogInfoMsg(f"恢复本轮已用时间: {self.current_usage_seconds}秒")
         except Exception:
             self.current_usage_seconds = 0
 
     def _persist_daily_usage(self):
-        """每秒写 CurrentUsage 供 GUI 实时读取；每分钟写 DailyUsage 持久化防关机丢失。"""
+        """每秒写 CurrentUsage 供 GUI 实时读取；每分钟写本轮用量防关机丢失。"""
         usage = int(self.current_usage_seconds)
         # 每秒都更新 CurrentUsage，GUI 3秒轮询时能看到最新值
         self._set_reg_value("CurrentUsage", usage)
@@ -441,6 +535,13 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         if current_minute != self.last_persist_minute:
             self.last_persist_minute = current_minute
             self._set_reg_value(self._today_key(), usage)
+
+    def _reset_usage_counter(self):
+        """重置本轮可用时间，确保服务重启后不会恢复上一轮已用秒数。"""
+        self.current_usage_seconds = 0
+        self.last_persist_minute = -1
+        self._set_reg_value("CurrentUsage", 0)
+        self._set_reg_value(self._today_key(), 0)
 
     def _log_console_snapshot(self, console_info):
         snapshot = format_session_snapshot(console_info)
@@ -497,6 +598,9 @@ class KidsModeService(win32serviceutil.ServiceFramework):
         last_lock_wall = self.load_lock_state()
         console_info = get_console_session_info()
         active_session = console_info["active_session_id"]
+        disconnect_session_id = console_info.get("disconnect_session_id")
+        if console_info.get("is_active") and console_info.get("is_unlocked") is not True:
+            active_session = None
         self._log_console_snapshot(console_info)
 
         elapsed_rest = None
@@ -516,26 +620,30 @@ class KidsModeService(win32serviceutil.ServiceFramework):
                 )
                 self.rest_end_logged = True
                 self._reset_rest_block_log()
+                self.clear_lock_state()
+                elapsed_rest = None
 
-        if active_session is not None:
+        if disconnect_session_id is not None:
             if enable_rest and elapsed_rest is not None and elapsed_rest < mandatory_rest:
                 remaining = int(mandatory_rest - elapsed_rest)
                 servicemanager.LogInfoMsg(f"Mandatory rest active, remaining: {remaining}s")
                 self._log_rest_block(console_info, remaining, rest_source)
-                self.current_usage_seconds = 0
+                self._reset_usage_counter()
                 self.session_was_active = False
-                if not disconnect_session(active_session):
-                    write_log(f"休息期断开控制台会话失败：session_id={active_session}")
+                if not disconnect_session(disconnect_session_id):
+                    write_log(f"休息期断开控制台会话失败：session_id={disconnect_session_id}")
                 return
 
+        if active_session is not None:
             remaining_usage = max_usage - self.current_usage_seconds
             if remaining_usage <= 180 and not self.warned_3min:
                 self.warned_3min = True
-                write_log(f"发送 3 分钟提醒：剩余 {remaining_usage} 秒，session_id={active_session}")
+                remaining_text = fmt_seconds(remaining_usage)
+                write_log(f"发送使用时间提醒：剩余 {remaining_usage} 秒，session_id={active_session}")
                 send_session_message(
                     active_session,
                     "  儿童模式提醒  ",
-                    f"\n  距离锁屏还有 3 分钟，请准备保存作业。  \n\n"
+                    f"\n  距离锁屏还有 {remaining_text}，请准备保存作业。  \n\n"
                     f"  已用时间：{fmt_seconds(self.current_usage_seconds)} / {fmt_seconds(max_usage)}  \n",
                     MB_ICONWARNING,
                     timeout=3,
@@ -561,7 +669,7 @@ class KidsModeService(win32serviceutil.ServiceFramework):
             if self.current_usage_seconds >= max_usage:
                 servicemanager.LogInfoMsg(f"Max usage reached: {max_usage}s")
                 write_log(
-                    f"锁屏触发：当日已用 {fmt_seconds(self.current_usage_seconds)}，"
+                    f"锁屏触发：本轮已用 {fmt_seconds(self.current_usage_seconds)}，"
                     f"target_session={active_session}，{format_session_snapshot(console_info)}"
                 )
                 lock_ts = time.time()
@@ -571,11 +679,10 @@ class KidsModeService(win32serviceutil.ServiceFramework):
                 self._reset_rest_block_log()
                 if not disconnect_session(active_session):
                     write_log(f"锁屏时断开控制台会话失败：session_id={active_session}")
-                self.current_usage_seconds = 0
+                self._reset_usage_counter()
                 self.session_was_active = False
                 self.warned_3min = False
                 self.warned_30sec = False
-                self._set_reg_value("CurrentUsage", 0)
         else:
             if self.session_was_active:
                 write_log(f"控制台会话离开活动状态，暂停计时：{format_session_snapshot(console_info)}")
@@ -679,7 +786,7 @@ class KidsModeManager(tk.Tk):
         stat_frame = tk.LabelFrame(self, text="实时状态", padx=15, pady=10)
         stat_frame.pack(padx=15, pady=4, fill="x")
 
-        self.lbl_today_used   = tk.Label(stat_frame, text="今日已用：--", anchor="w",
+        self.lbl_today_used   = tk.Label(stat_frame, text="本轮已用：--", anchor="w",
                                           font=("Microsoft YaHei UI", 10))
         self.lbl_today_used.pack(fill="x", pady=2)
         self.lbl_remaining    = tk.Label(stat_frame, text="距锁屏剩余：--", anchor="w",
@@ -754,7 +861,7 @@ class KidsModeManager(tk.Tk):
                 last_lock = 0.0
 
             self.lbl_today_used.config(
-                text=f"今日已用：{fmt_seconds(current_usage)} / {fmt_seconds(max_usage)}"
+                text=f"本轮已用：{fmt_seconds(current_usage)} / {fmt_seconds(max_usage)}"
             )
 
             now = time.time()
@@ -814,10 +921,8 @@ class KidsModeManager(tk.Tk):
             messagebox.showerror("错误", f"保存配置失败: {e}")
             return
 
-        # Task #12: 服务运行中时询问是否立即重启生效
         if self._is_service_running():
-            if messagebox.askyesno("重启服务", "配置已保存。\n是否立即重启服务以使新配置生效？"):
-                self.restart_service(silent=True)
+            messagebox.showinfo("成功", "配置已保存，服务将在 1 秒内自动读取新配置。")
         else:
             messagebox.showinfo("成功", "配置已保存。")
 
